@@ -12,7 +12,11 @@ engine = create_async_engine(
     settings.database_url,
     echo=settings.database_echo,  # 控制是否打印 SQL
     future=True,
-    connect_args={"timeout": 30}
+    connect_args={"timeout": 60},  # 增大连接超时
+    pool_size=50,                  # 基准连接池大小
+    max_overflow=100,              # 最大允许溢出的连接数
+    pool_recycle=3600,             # 每小时回收连接防止失效
+    pool_pre_ping=True             # 每次使用连接前进行活跃性检测
 )
 
 # 创建异步会话工厂
