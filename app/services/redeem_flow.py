@@ -10,7 +10,6 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from sqlalchemy import select, update, delete, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.database import AsyncSessionLocal
 
 from app.models import RedemptionCode, RedemptionRecord, Team
 from app.services.redemption import RedemptionService
@@ -168,13 +167,14 @@ class RedeemFlowService:
     ) -> Dict[str, Any]:
         """
         完整的兑换流程 (带事务和并发控制)
+        带同步验证：send_invite 成功后同步检查成员是否真实加入，防止虚假成功浪费兑换码。
+        虚假成功时自动回滚并重试其他 Team。
         """
         last_error = "未知错误"
         max_retries = 3
+        # 用于跟踪因虚假成功被排除的 Team
+        excluded_team_ids: List[int] = []
         current_target_team_id = team_id
-        core_success = False
-        success_result = None
-        team_id_final = None
 
         # 针对 code 加锁，防止同一个码并发进入兑换
         async with _code_locks[code]:
@@ -185,8 +185,13 @@ class RedeemFlowService:
                     # 确定目标 Team (初选)
                     team_id_final = current_target_team_id
                     if not team_id_final:
-                        select_res = await self.select_team_auto(db_session)
+                        select_res = await self.select_team_auto(
+                            db_session,
+                            exclude_team_ids=excluded_team_ids if excluded_team_ids else None
+                        )
                         if not select_res["success"]:
+                            if excluded_team_ids:
+                                return {"success": False, "error": "暂时没有可用车位，请稍后再试"}
                             return {"success": False, "error": select_res["error"]}
                         team_id_final = select_res["team_id"]
                         current_target_team_id = team_id_final
@@ -289,7 +294,7 @@ class RedeemFlowService:
                                     await db_session.rollback()
                                     raise Exception(err)
 
-                            # 成功逻辑
+                            # 成功逻辑：先提交码和记录，再做同步验证
                             rc.status = "used"
                             rc.used_by_email = email
                             rc.used_team_id = team_id_final
@@ -311,9 +316,31 @@ class RedeemFlowService:
                                 target_team.status = "full"
                             
                             await db_session.commit()
-                            
-                            # 核心步骤成功，准备返回结果
-                            success_result = {
+                        except Exception as e:
+                            if db_session.in_transaction():
+                                await db_session.rollback()
+                            raise e
+
+                        # 5. 同步验证：确认成员真实加入（防止虚假成功）
+                        # 初始等待 3s，后续每次重试间隔 3s，最多重试 3 次（总计最多 ~9s）
+                        _VERIFY_SLEEP_SECS = 3
+                        _VERIFY_MAX_RETRIES = 3
+                        is_verified = False
+                        for v in range(_VERIFY_MAX_RETRIES):
+                            await asyncio.sleep(_VERIFY_SLEEP_SECS)
+                            sync_res = await self.team_service.sync_team_info(team_id_final, db_session)
+                            member_emails = [m.lower() for m in sync_res.get("member_emails", [])]
+                            if email.lower() in member_emails:
+                                is_verified = True
+                                logger.info(f"Team {team_id_final} 同步验证成功 (第 {v+1} 次)")
+                                break
+                            if v < _VERIFY_MAX_RETRIES - 1:
+                                logger.warning(f"Team {team_id_final} 验证第 {v+1} 次未见成员 {email}，继续等待...")
+
+                        if is_verified:
+                            # 真正成功，触发补货通知
+                            asyncio.create_task(notification_service.check_and_notify_low_stock())
+                            return {
                                 "success": True,
                                 "message": "兑换成功！邀请链接已发送至您的邮箱，请及时查收。",
                                 "team_info": {
@@ -323,15 +350,59 @@ class RedeemFlowService:
                                     "expires_at": target_team.expires_at.isoformat() if target_team.expires_at else None
                                 }
                             }
-                            core_success = True
+
+                        # 虚假成功：回滚兑换码、记录、成员计数，并将该 Team 标记为 cooldown
+                        logger.error(f'检测到“虚假成功”: Team {team_id_final} 邀请返回成功但 {_VERIFY_SLEEP_SECS * _VERIFY_MAX_RETRIES}s 后仍查不到成员 {email}')
+                        
+                        if not db_session.in_transaction():
+                            await db_session.begin()
+                        try:
+                            # 回滚兑换码状态
+                            res = await db_session.execute(select(RedemptionCode).where(RedemptionCode.code == code).with_for_update())
+                            rc_rb = res.scalar_one_or_none()
+                            if rc_rb and rc_rb.status == "used" and rc_rb.used_team_id == team_id_final:
+                                rc_rb.status = "unused"
+                                rc_rb.used_by_email = None
+                                rc_rb.used_team_id = None
+                                rc_rb.used_at = None
+                                rc_rb.warranty_expires_at = None
+                                logger.warning(f"已将兑换码 {code} 回滚为 unused（虚假成功补偿）")
+                            elif rc_rb:
+                                logger.warning(f"先前提交的兑换码 {code} 状态已不符合预期 (status={rc_rb.status}, used_team_id={rc_rb.used_team_id})，可能已被并发修改，跳过回滚")
+
+                            # 删除兑换记录
+                            await db_session.execute(
+                                delete(RedemptionRecord).where(
+                                    RedemptionRecord.code == code,
+                                    RedemptionRecord.team_id == team_id_final,
+                                    RedemptionRecord.email == email
+                                )
+                            )
+
+                            # 回滚 Team 成员计数
+                            res = await db_session.execute(select(Team).where(Team.id == team_id_final).with_for_update())
+                            t_rb = res.scalar_one_or_none()
+                            if t_rb:
+                                if t_rb.current_members > 0:
+                                    t_rb.current_members -= 1
+                                # 标记 Team 为 cooldown
+                                t_rb.status = "cooldown"
+                                t_rb.cooldown_until = get_now() + timedelta(hours=24)
+                                logger.warning(f"Team {team_id_final} 已标记为 cooldown，冷却 24 小时")
+
+                            await db_session.commit()
                         except Exception as e:
                             if db_session.in_transaction():
                                 await db_session.rollback()
-                            raise e
+                            logger.error(f"虚假成功回滚失败: {e}")
 
-                    # 如果核心步骤成功，跳出重试循环
-                    if core_success:
-                        break
+                        # 将该 Team 加入排除列表，下次尝试其他 Team
+                        excluded_team_ids.append(team_id_final)
+                        current_target_team_id = None
+                        last_error = f"Team {team_id_final} 虚假成功"
+                        
+                        # 尝试下一个 Team（直接进入下一轮循环）
+                        continue
 
                 except Exception as e:
                     last_error = str(e)
@@ -347,7 +418,7 @@ class RedeemFlowService:
                     if any(kw in last_error for kw in ["不存在", "已使用", "已有正在使用", "质保已过期"]):
                         return {"success": False, "error": last_error}
 
-                    # 判定是否需要永久标记为“满员”
+                    # 判定是否需要永久标记为"满员"
                     if any(kw in last_error.lower() for kw in ["已满", "seats", "full"]):
                         try:
                             if not team_id:
@@ -364,53 +435,16 @@ class RedeemFlowService:
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue
             
-            if core_success:
-                # 后台异步验证任务 (循环检测 3 次，确保 API 数据同步) - 移至后台以极大提高并发并防止 HTTP 超时
-                asyncio.create_task(self._background_verify_sync(team_id_final, email))
-                
-                # 补货通知任务 (异步)
-                asyncio.create_task(notification_service.check_and_notify_low_stock())
-                    
-                return success_result
-            else:
+            # 所有尝试均失败
+            if excluded_team_ids:
                 return {
                     "success": False,
-                    "error": f"兑换失败次数过多。最后报错: {last_error}"
+                    "error": "暂时没有可用车位，请稍后再试"
                 }
-
-    async def _background_verify_sync(self, team_id: int, email: str):
-        """
-        后台异步验证并同步 (不阻塞 HTTP 请求)
-        """
-        async with AsyncSessionLocal() as db_session:
-            try:
-                is_verified = False
-                for i in range(3):
-                    await asyncio.sleep(5)
-                    # 每次同步前确保 session 是最新的
-                    sync_res = await self.team_service.sync_team_info(team_id, db_session)
-                    member_emails = [m.lower() for m in sync_res.get("member_emails", [])]
-                    if email.lower() in member_emails:
-                        is_verified = True
-                        logger.info(f"Team {team_id} [Background] 同步确认成功 (尝试第 {i+1} 次)")
-                        break
-                    
-                    if i < 2:
-                        logger.warning(f"Team {team_id} [Background] 尚未见到成员 {email}，准备第 {i+2} 次重试...")
-                
-                if not is_verified:
-                    logger.error(f"检测到“虚假成功”: Team {team_id} 兑换成功但 15s 后仍查不到成员 {email}")
-                    # 在后台标记异常
-                    stmt = select(Team).where(Team.id == team_id)
-                    t_res = await db_session.execute(stmt)
-                    target_t = t_res.scalar_one_or_none()
-                    if target_t:
-                        await self.team_service._handle_api_error(
-                            {"success": False, "error": "兑换成功但 3 次同步均未见成员", "error_code": "ghost_success"},
-                            target_t, db_session
-                        )
-            except Exception as e:
-                logger.error(f"后台同步校验发生异常: {e}")
+            return {
+                "success": False,
+                "error": f"兑换失败次数过多。最后报错: {last_error}"
+            }
 
 # 创建全局实例
 redeem_flow_service = RedeemFlowService()

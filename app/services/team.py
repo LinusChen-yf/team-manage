@@ -5,7 +5,7 @@ Team 管理服务
 import logging
 import asyncio
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -72,8 +72,9 @@ class TeamService:
                 
         # 1.1 判定是否为“虚假成功” (Ghost Success)
         if error_code == "ghost_success":
-            logger.error(f"检测到 Team {team.id} ({team.email}) 存在“虚假成功”现象 (邀请返回 200 但列表无成员)，标记为 error")
-            team.status = "error"
+            logger.error(f"检测到 Team {team.id} ({team.email}) 存在“虚假成功”现象 (邀请返回 200 但列表无成员)，标记为 cooldown")
+            team.status = "cooldown"
+            team.cooldown_until = get_now() + timedelta(hours=24)
             if not db_session.in_transaction():
                 await db_session.commit()
             return True
@@ -149,16 +150,23 @@ class TeamService:
         成功执行请求后重置错误计数并尝试从 error 状态恢复
         """
         team.error_count = 0
-        if team.status == "error":
+        # cooldown/banned 状态不应被自动恢复覆盖
+        if team.status == "cooldown":
+            if team.cooldown_until and team.cooldown_until > get_now():
+                # 冷却期未过，保持 cooldown 状态不变
+                if not db_session.in_transaction():
+                    await db_session.commit()
+                return
+        if team.status in ("error", "cooldown"):
             # 恢复时也要校验是否满员或到期
             if team.current_members >= team.max_members:
-                logger.info(f"Team {team.id} ({team.email}) 请求成功, 将状态从 error 恢复为 full")
+                logger.info(f"Team {team.id} ({team.email}) 请求成功, 将状态从 {team.status} 恢复为 full")
                 team.status = "full"
             elif team.expires_at and team.expires_at < datetime.now():
-                logger.info(f"Team {team.id} ({team.email}) 请求成功, 将状态从 error 恢复为 expired")
+                logger.info(f"Team {team.id} ({team.email}) 请求成功, 将状态从 {team.status} 恢复为 expired")
                 team.status = "expired"
             else:
-                logger.info(f"Team {team.id} ({team.email}) 请求成功, 将状态从 error 恢复为 active")
+                logger.info(f"Team {team.id} ({team.email}) 请求成功, 将状态从 {team.status} 恢复为 active")
                 team.status = "active"
         if not db_session.in_transaction():
             await db_session.commit()
@@ -1040,6 +1048,15 @@ class TeamService:
                 status = "full"
             elif expires_at and expires_at < datetime.now():
                 status = "expired"
+            # 保护 cooldown/error/banned 状态不被无条件覆盖
+            if team.status == "cooldown":
+                if team.cooldown_until and team.cooldown_until > get_now():
+                    # 冷却期未过，保持 cooldown 状态
+                    status = "cooldown"
+                # 否则冷却已过，使用正常计算的 status
+            elif team.status in ("error", "banned"):
+                # error/banned 状态不应被 sync 覆盖，保持原状态
+                status = team.status
             
             # 8. 更新 Team 信息
             team.account_id = current_account["account_id"]

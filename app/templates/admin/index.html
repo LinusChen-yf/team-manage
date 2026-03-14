@@ -68,6 +68,7 @@
                         {% elif status_filter == 'expired' %}已过期
                         {% elif status_filter == 'error' %}异常
                         {% elif status_filter == 'banned' %}已封禁
+                        {% elif status_filter == 'cooldown' %}冷却中
                         {% else %}状态筛选
                         {% endif %}
                     </span>
@@ -91,6 +92,9 @@
                     </div>
                     <div class="dropdown-item" onclick="filterByStatus('banned')">
                         <span class="status-badge status-banned">已封禁 (Banned)</span>
+                    </div>
+                    <div class="dropdown-item" onclick="filterByStatus('cooldown')">
+                        <span class="status-badge status-cooldown">冷却中 (Cooldown)</span>
                     </div>
                 </div>
             </div>
@@ -194,6 +198,8 @@
                         已封禁
                         {% elif team.status == 'error' %}
                         异常
+                        {% elif team.status == 'cooldown' %}
+                        冷却中
                         {% else %}
                         未知
                         {% endif %}
@@ -389,6 +395,7 @@
                         <option value="expired">已过期 (Expired)</option>
                         <option value="error">异常 (Error)</option>
                         <option value="banned">已封禁 (Banned)</option>
+                        <option value="cooldown">冷却中 (Cooldown)</option>
                     </select>
                 </div>
                 <button type="submit" class="btn btn-primary">保存修改</button>
