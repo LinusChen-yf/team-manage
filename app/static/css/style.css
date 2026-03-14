@@ -759,6 +759,12 @@ body {
     border: 1px solid #cbd5e1;
 }
 
+.status-cooldown {
+    background: var(--warning-soft);
+    color: var(--warning);
+    border: 1px solid var(--warning-soft);
+}
+
 .role-badge {
     display: inline-block;
     padding: 0.2rem 0.5rem;
