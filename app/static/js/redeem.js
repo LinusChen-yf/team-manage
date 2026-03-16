@@ -157,17 +157,26 @@ async function confirmRedeem(teamId) {
     // The button disable logic handles that.
 
     try {
-        const response = await fetch('/redeem/confirm', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                email: currentEmail,
-                code: currentCode,
-                team_id: teamId
-            })
-        });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 180000); // 3 分钟超时
+
+        let response;
+        try {
+            response = await fetch('/redeem/confirm', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    email: currentEmail,
+                    code: currentCode,
+                    team_id: teamId
+                }),
+                signal: controller.signal
+            });
+        } finally {
+            clearTimeout(timeoutId);
+        }
 
         console.log('Response status:', response.status);
 
@@ -208,7 +217,11 @@ async function confirmRedeem(teamId) {
         }
     } catch (error) {
         console.error('Network or logic error:', error);
-        showErrorResult(error.message || '网络错误,请稍后重试');
+        if (error.name === 'AbortError') {
+            showErrorResult('请求超时，请稍后查看邮箱确认是否收到邀请');
+        } else {
+            showErrorResult(error.message || '网络错误,请稍后重试');
+        }
     }
 }
 
