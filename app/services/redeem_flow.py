@@ -169,8 +169,8 @@ class RedeemFlowService:
     ) -> Dict[str, Any]:
         """
         完整的兑换流程 (带事务和并发控制)
-        带同步验证：send_invite 成功后同步检查成员是否真实加入，防止虚假成功浪费兑换码。
-        虚假成功时自动回滚并重试其他 Team。
+        send_invite 成功后立即返回前端，后台异步验证成员是否真实加入（防止虚假成功）。
+        虚假成功时后台自动回滚并标记 Team 为 error，不影响前端响应速度。
         """
         last_error = "未知错误"
         # 用于跟踪因失败被排除的 Team（使用 set 保证 O(1) 查找）
@@ -329,87 +329,27 @@ class RedeemFlowService:
                                 await db_session.rollback()
                             raise e
 
-                        # 5. 同步验证：确认成员真实加入（防止虚假成功）
-                        # 初始等待 3s，后续每次重试间隔 3s，最多重试 3 次（总计最多 ~9s）
-                        _VERIFY_SLEEP_SECS = 3
-                        _VERIFY_MAX_RETRIES = 3
-                        is_verified = False
-                        for v in range(_VERIFY_MAX_RETRIES):
-                            await asyncio.sleep(_VERIFY_SLEEP_SECS)
-                            sync_res = await self.team_service.sync_team_info(team_id_final, db_session)
-                            member_emails = [m.lower() for m in sync_res.get("member_emails", [])]
-                            if email.lower() in member_emails:
-                                is_verified = True
-                                logger.info(f"Team {team_id_final} 同步验证成功 (第 {v+1} 次)")
-                                break
-                            if v < _VERIFY_MAX_RETRIES - 1:
-                                logger.warning(f"Team {team_id_final} 验证第 {v+1} 次未见成员 {email}，继续等待...")
-
-                        if is_verified:
-                            # 真正成功，触发补货通知
-                            asyncio.create_task(notification_service.check_and_notify_low_stock())
-                            return {
-                                "success": True,
-                                "message": "兑换成功！邀请链接已发送至您的邮箱，请及时查收。",
-                                "team_info": {
-                                    "id": team_id_final,
-                                    "team_name": target_team.team_name,
-                                    "email": target_team.email,
-                                    "expires_at": target_team.expires_at.isoformat() if target_team.expires_at else None
-                                }
-                            }
-
-                        # 虚假成功：回滚兑换码、记录、成员计数，并将该 Team 标记为 error（不可用）
-                        logger.error(f'检测到“虚假成功”: Team {team_id_final} 邀请返回成功但 {_VERIFY_SLEEP_SECS * _VERIFY_MAX_RETRIES}s 后仍查不到成员 {email}')
-                        
-                        if not db_session.in_transaction():
-                            await db_session.begin()
-                        try:
-                            # 回滚兑换码状态
-                            res = await db_session.execute(select(RedemptionCode).where(RedemptionCode.code == code).with_for_update())
-                            rc_rb = res.scalar_one_or_none()
-                            if rc_rb and rc_rb.status == "used" and rc_rb.used_team_id == team_id_final:
-                                rc_rb.status = "unused"
-                                rc_rb.used_by_email = None
-                                rc_rb.used_team_id = None
-                                rc_rb.used_at = None
-                                rc_rb.warranty_expires_at = None
-                                logger.warning(f"已将兑换码 {code} 回滚为 unused（虚假成功补偿）")
-                            elif rc_rb:
-                                logger.warning(f"先前提交的兑换码 {code} 状态已不符合预期 (status={rc_rb.status}, used_team_id={rc_rb.used_team_id})，可能已被并发修改，跳过回滚")
-
-                            # 删除兑换记录
-                            await db_session.execute(
-                                delete(RedemptionRecord).where(
-                                    RedemptionRecord.code == code,
-                                    RedemptionRecord.team_id == team_id_final,
-                                    RedemptionRecord.email == email
-                                )
+                        # 5. 后台异步验证：邀请成功后立即返回前端，后台确认成员真实加入
+                        # 如果是虚假成功，后台自动回滚并标记 Team 为 error
+                        asyncio.create_task(
+                            self._background_verify_and_rollback(
+                                email=email,
+                                code=code,
+                                team_id=team_id_final,
+                                team_name=target_team.team_name,
                             )
+                        )
 
-                            # 回滚 Team 成员计数
-                            res = await db_session.execute(select(Team).where(Team.id == team_id_final).with_for_update())
-                            t_rb = res.scalar_one_or_none()
-                            if t_rb:
-                                if t_rb.current_members > 0:
-                                    t_rb.current_members -= 1
-                                # 标记 Team 为不可用
-                                t_rb.status = "error"
-                                logger.warning(f"Team {team_id_final} 虚假成功，已标记为 error（不可用）")
-
-                            await db_session.commit()
-                        except Exception as e:
-                            if db_session.in_transaction():
-                                await db_session.rollback()
-                            logger.error(f"虚假成功回滚失败: {e}")
-
-                        # 将该 Team 加入排除列表，下次尝试其他 Team
-                        excluded_team_ids.add(team_id_final)
-                        current_target_team_id = None
-                        last_error = f"Team {team_id_final} 虚假成功"
-                        
-                        # 尝试下一个 Team（直接进入下一轮循环）
-                        continue
+                        return {
+                            "success": True,
+                            "message": "兑换成功！邀请链接已发送至您的邮箱，请及时查收。",
+                            "team_info": {
+                                "id": team_id_final,
+                                "team_name": target_team.team_name,
+                                "email": target_team.email,
+                                "expires_at": target_team.expires_at.isoformat() if target_team.expires_at else None
+                            }
+                        }
 
                 except Exception as e:
                     last_error = str(e)
@@ -451,6 +391,93 @@ class RedeemFlowService:
                 "success": False,
                 "error": "当前没有可用 Team，请稍后再试"
             }
+
+    async def _background_verify_and_rollback(
+        self,
+        email: str,
+        code: str,
+        team_id: int,
+        team_name: str,
+    ) -> None:
+        """
+        后台异步任务：验证邀请是否真实生效，如果是虚假成功则自动回滚并标记 Team 为 error。
+        使用独立的数据库会话，避免与主流程共享会话冲突。
+        """
+        from app.database import AsyncSessionLocal
+        _VERIFY_SLEEP_SECS = 3
+        _VERIFY_MAX_RETRIES = 3
+
+        async with AsyncSessionLocal() as bg_session:
+            try:
+                is_verified = False
+                for v in range(_VERIFY_MAX_RETRIES):
+                    await asyncio.sleep(_VERIFY_SLEEP_SECS)
+                    sync_res = await self.team_service.sync_team_info(team_id, bg_session)
+                    member_emails = [m.lower() for m in sync_res.get("member_emails", [])]
+                    if email.lower() in member_emails:
+                        is_verified = True
+                        logger.info(f"[后台验证] Team {team_id} 同步验证成功 (第 {v+1} 次)，成员 {email} 已确认加入")
+                        break
+                    if v < _VERIFY_MAX_RETRIES - 1:
+                        logger.warning(f"[后台验证] Team {team_id} 第 {v+1} 次未见成员 {email}，继续等待...")
+
+                if is_verified:
+                    await notification_service.check_and_notify_low_stock()
+                    return
+
+                # 虚假成功：回滚兑换码、记录、成员计数，并将该 Team 标记为 error（不可用）
+                logger.error(
+                    f'[后台验证] 检测到"虚假成功": Team {team_id} 邀请返回成功但 '
+                    f'{_VERIFY_SLEEP_SECS * _VERIFY_MAX_RETRIES}s 后仍查不到成员 {email}，执行回滚'
+                )
+
+                if not bg_session.in_transaction():
+                    await bg_session.begin()
+                try:
+                    # 回滚兑换码状态
+                    res = await bg_session.execute(select(RedemptionCode).where(RedemptionCode.code == code).with_for_update())
+                    rc_rb = res.scalar_one_or_none()
+                    if rc_rb and rc_rb.status == "used" and rc_rb.used_team_id == team_id:
+                        rc_rb.status = "unused"
+                        rc_rb.used_by_email = None
+                        rc_rb.used_team_id = None
+                        rc_rb.used_at = None
+                        rc_rb.warranty_expires_at = None
+                        logger.warning(f"[后台验证] 已将兑换码 {code} 回滚为 unused（虚假成功补偿）")
+                    elif rc_rb:
+                        logger.warning(
+                            f"[后台验证] 兑换码 {code} 状态已不符合预期 "
+                            f"(status={rc_rb.status}, used_team_id={rc_rb.used_team_id})，可能已被并发修改，跳过回滚"
+                        )
+
+                    # 删除兑换记录
+                    await bg_session.execute(
+                        delete(RedemptionRecord).where(
+                            RedemptionRecord.code == code,
+                            RedemptionRecord.team_id == team_id,
+                            RedemptionRecord.email == email
+                        )
+                    )
+
+                    # 回滚 Team 成员计数并标记为 error
+                    res = await bg_session.execute(select(Team).where(Team.id == team_id).with_for_update())
+                    t_rb = res.scalar_one_or_none()
+                    if t_rb:
+                        if t_rb.current_members > 0:
+                            t_rb.current_members -= 1
+                        t_rb.status = "error"
+                        logger.warning(f"[后台验证] Team {team_id} 虚假成功，已标记为 error（不可用）")
+
+                    await bg_session.commit()
+                except Exception as e:
+                    if bg_session.in_transaction():
+                        await bg_session.rollback()
+                    logger.error(f"[后台验证] 虚假成功回滚失败: {e}")
+
+            except Exception as e:
+                logger.error(f"[后台验证] 后台验证任务异常: {e}")
+                logger.error(traceback.format_exc())
+
 
 # 创建全局实例
 redeem_flow_service = RedeemFlowService()
