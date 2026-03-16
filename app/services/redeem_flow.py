@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 _code_locks = defaultdict(asyncio.Lock)
 # 全局 Team 锁: 针对 Team 进行加锁，防止并发拉人导致的人数状态不同步
 _team_locks = defaultdict(asyncio.Lock)
+# 单次兑换流程中最多尝试的 Team 数量上限，防止可用 Team 极多时产生死循环或过长等待
+_MAX_TEAM_RETRY_LIMIT = 50
 
 
 class RedeemFlowService:
@@ -171,13 +173,21 @@ class RedeemFlowService:
         虚假成功时自动回滚并重试其他 Team。
         """
         last_error = "未知错误"
-        max_retries = 3
-        # 用于跟踪因虚假成功被排除的 Team
-        excluded_team_ids: List[int] = []
+        # 用于跟踪因失败被排除的 Team（使用 set 保证 O(1) 查找）
+        excluded_team_ids: set = set()
         current_target_team_id = team_id
 
         # 针对 code 加锁，防止同一个码并发进入兑换
         async with _code_locks[code]:
+            # 动态计算当前可用 Team 总数作为最大重试次数，确保遍历所有可用 Team
+            count_stmt = select(func.count()).select_from(Team).where(
+                Team.status == "active",
+                Team.current_members < Team.max_members
+            )
+            count_res = await db_session.execute(count_stmt)
+            available_count = count_res.scalar() or 0
+            max_retries = max(1, min(_MAX_TEAM_RETRY_LIMIT, available_count))
+
             for attempt in range(max_retries):
                 logger.info(f"兑换尝试 {attempt + 1}/{max_retries} (Code: {code}, Email: {email})")
                 
@@ -190,9 +200,7 @@ class RedeemFlowService:
                             exclude_team_ids=excluded_team_ids if excluded_team_ids else None
                         )
                         if not select_res["success"]:
-                            if excluded_team_ids:
-                                return {"success": False, "error": "暂时没有可用车位，请稍后再试"}
-                            return {"success": False, "error": select_res["error"]}
+                            return {"success": False, "error": "当前没有可用 Team，请稍后再试"}
                         team_id_final = select_res["team_id"]
                         current_target_team_id = team_id_final
                     
@@ -351,7 +359,7 @@ class RedeemFlowService:
                                 }
                             }
 
-                        # 虚假成功：回滚兑换码、记录、成员计数，并将该 Team 标记为 cooldown
+                        # 虚假成功：回滚兑换码、记录、成员计数，并将该 Team 标记为 error（不可用）
                         logger.error(f'检测到“虚假成功”: Team {team_id_final} 邀请返回成功但 {_VERIFY_SLEEP_SECS * _VERIFY_MAX_RETRIES}s 后仍查不到成员 {email}')
                         
                         if not db_session.in_transaction():
@@ -385,10 +393,9 @@ class RedeemFlowService:
                             if t_rb:
                                 if t_rb.current_members > 0:
                                     t_rb.current_members -= 1
-                                # 标记 Team 为 cooldown
-                                t_rb.status = "cooldown"
-                                t_rb.cooldown_until = get_now() + timedelta(hours=24)
-                                logger.warning(f"Team {team_id_final} 已标记为 cooldown，冷却 24 小时")
+                                # 标记 Team 为不可用
+                                t_rb.status = "error"
+                                logger.warning(f"Team {team_id_final} 虚假成功，已标记为 error（不可用）")
 
                             await db_session.commit()
                         except Exception as e:
@@ -397,7 +404,7 @@ class RedeemFlowService:
                             logger.error(f"虚假成功回滚失败: {e}")
 
                         # 将该 Team 加入排除列表，下次尝试其他 Team
-                        excluded_team_ids.append(team_id_final)
+                        excluded_team_ids.add(team_id_final)
                         current_target_team_id = None
                         last_error = f"Team {team_id_final} 虚假成功"
                         
@@ -418,6 +425,11 @@ class RedeemFlowService:
                     if any(kw in last_error for kw in ["不存在", "已使用", "已有正在使用", "质保已过期"]):
                         return {"success": False, "error": last_error}
 
+                    # 将失败的 Team 加入排除列表，换一个 Team 继续尝试
+                    if team_id_final:
+                        excluded_team_ids.add(team_id_final)
+                    current_target_team_id = None
+
                     # 判定是否需要永久标记为"满员"
                     if any(kw in last_error.lower() for kw in ["已满", "seats", "full"]):
                         try:
@@ -427,23 +439,17 @@ class RedeemFlowService:
                                     sqlalchemy_update(Team).where(Team.id == team_id_final).values(status="full")
                                 )
                                 await db_session.commit()
-                            current_target_team_id = None
                         except:
                             pass
                     
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(1.5 * (attempt + 1))
+                        await asyncio.sleep(1.5)
                         continue
             
-            # 所有尝试均失败
-            if excluded_team_ids:
-                return {
-                    "success": False,
-                    "error": "暂时没有可用车位，请稍后再试"
-                }
+            # 所有可用 Team 均尝试失败
             return {
                 "success": False,
-                "error": f"兑换失败次数过多。最后报错: {last_error}"
+                "error": "当前没有可用 Team，请稍后再试"
             }
 
 # 创建全局实例
