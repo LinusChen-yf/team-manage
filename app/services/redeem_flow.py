@@ -229,6 +229,25 @@ class RedeemFlowService:
                 available_count = count_res.scalar() or 0
                 max_retries = max(1, min(_MAX_TEAM_RETRY_LIMIT, available_count))
 
+                # 前置快速检查：所有可用 Team 的锁是否全部被占用
+                available_teams_stmt = select(Team.id).where(
+                    Team.status == "active",
+                    Team.current_members < Team.max_members
+                )
+                if excluded_team_ids:
+                    available_teams_stmt = available_teams_stmt.where(Team.id.not_in(list(excluded_team_ids)))
+                available_teams_res = await db_session.execute(available_teams_stmt)
+                available_team_ids = [r[0] for r in available_teams_res.fetchall()]
+
+                if available_team_ids:
+                    all_locked = all(_team_locks[tid].locked() for tid in available_team_ids)
+                    if all_locked:
+                        logger.warning(
+                            f"所有可用 Team 的锁均被占用 (code={code}, email={email}, "
+                            f"locked_teams={available_team_ids})，立即返回系统繁忙"
+                        )
+                        return {"success": False, "error": "系统繁忙，请稍后再试"}
+
                 for attempt in range(max_retries):
                     logger.info(f"兑换尝试 {attempt + 1}/{max_retries} (Code: {code}, Email: {email})")
 
@@ -259,6 +278,21 @@ class RedeemFlowService:
                             excluded_team_ids.add(team_id_final)
                             current_target_team_id = None
                             last_error = "系统繁忙，请稍后再试"
+
+                            # 快速检查剩余可用 Team 是否全被锁定，避免继续无意义等待
+                            remaining_stmt = select(Team.id).where(
+                                Team.status == "active",
+                                Team.current_members < Team.max_members,
+                                Team.id.not_in(list(excluded_team_ids))
+                            )
+                            remaining_res = await db_session.execute(remaining_stmt)
+                            remaining_ids = [r[0] for r in remaining_res.fetchall()]
+                            if not remaining_ids or all(_team_locks[tid].locked() for tid in remaining_ids):
+                                logger.warning(
+                                    f"剩余可用 Team 全部被锁定或已耗尽 (code={code}, email={email})，立即返回系统繁忙"
+                                )
+                                break
+
                             if attempt < max_retries - 1:
                                 continue
                             break
