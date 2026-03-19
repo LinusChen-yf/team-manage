@@ -317,10 +317,7 @@ async function handleBatchImport(event) {
                             showToast(`导入完成，成功 ${data.success_count} 条，失败 ${data.failed_count} 条`, 'warning');
                         }
 
-                        // 刷新页面以显示新数据
-                        if (data.success_count > 0) {
-                            setTimeout(() => location.reload(), 3000);
-                        }
+
                     } else if (data.type === 'error') {
                         showToast(data.error, 'error');
                     }
