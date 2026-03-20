@@ -150,7 +150,12 @@ class TeamService:
         成功执行请求后重置错误计数并尝试从 error 状态恢复
         """
         team.error_count = 0
-        # cooldown/banned 状态不应被自动恢复覆盖
+        # banned 是终态，不允许自动恢复
+        if team.status == "banned":
+            if not db_session.in_transaction():
+                await db_session.commit()
+            return
+        # cooldown 状态需要单独判断是否已过期
         if team.status == "cooldown":
             if team.cooldown_until and team.cooldown_until > get_now():
                 # 冷却期未过，保持 cooldown 状态不变
@@ -645,6 +650,7 @@ class TeamService:
                 team.status = status
             
             # 自动维护 active/full/expired 状态 (仅当当前处于这三者之一或刚更新了 max_members/status)
+            # banned 和 error 是需要人工干预的终态，不在此列表中，不会被自动维护逻辑覆盖
             if team.status in ["active", "full", "expired"]:
                 if team.current_members >= team.max_members:
                     team.status = "full"
@@ -839,6 +845,15 @@ class TeamService:
                     "success": False,
                     "message": None,
                     "error": f"Team ID {team_id} 不存在"
+                }
+
+            # 1.5 如果 Team 已被标记为 banned，跳过同步（banned 是终态，需管理员手动解除）
+            if team.status == "banned":
+                logger.info(f"Team {team_id} 状态为 banned，跳过自动同步")
+                return {
+                    "success": False,
+                    "message": None,
+                    "error": "Team 账号已封禁/失效，跳过自动同步。如需恢复请手动更新状态。"
                 }
 
             # 2. 确保 AT Token 有效
