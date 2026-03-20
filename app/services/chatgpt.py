@@ -143,6 +143,18 @@ class ChatGPTService:
                             error_code = error_info.get("code") if isinstance(error_info, dict) else error_data.get("code")
                     except Exception:
                         pass
+                    # 兜底：若 JSON 解析未能提取 error_code，从响应文本中匹配已知错误码
+                    if not error_code:
+                        _known_codes = [
+                            "token_invalidated", "account_deactivated", "account_suspended",
+                            "account_not_found", "user_not_found", "deactivated_workspace",
+                            "token_expired",
+                        ]
+                        raw_lower = response.text.lower()
+                        for _code in _known_codes:
+                            if _code in raw_lower:
+                                error_code = _code
+                                break
                     
                     if error_code == "token_invalidated" or "token_invalidated" in str(error_msg).lower():
                         logger.warning(f"检测到 Token 失效，清理会话缓存: {identifier}")
