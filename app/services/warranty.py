@@ -208,8 +208,9 @@ class WarrantyService:
                         primary_expiry = expiry_date
                         primary_code = code_obj.code
 
-                # 记录封号 Team
-                if team.status == "banned":
+                # 记录不可用 Team（封号、异常、过期）
+                team_is_expired = team.expires_at and team.expires_at < get_now()
+                if team.status in ("banned", "error", "expired") or team_is_expired:
                     banned_teams_info.append({
                         "team_id": team.id,
                         "team_name": team.team_name,
@@ -232,7 +233,7 @@ class WarrantyService:
                     "device_code_auth_enabled": team.device_code_auth_enabled
                 })
 
-            # 3. 判断是否可以重复使用 (只要有有效的质保码且有被封的 Team)
+            # 3. 判断是否可以重复使用 (只要有有效的质保码且有不可用的 Team)
             if has_any_warranty and primary_warranty_valid and len(banned_teams_info) > 0:
                 # 进一步验证 (使用现有的 validate_warranty_reuse 逻辑)
                 # 这里为了简单直接复用逻辑判断
@@ -389,27 +390,29 @@ class WarrantyService:
                             "error": None
                         }
 
-            # 6. 检查是否有过被封的记录
-            has_banned_team = False
+            # 6. 检查是否有过不可用（封号/异常/过期）的记录
+            has_unavailable_team = False
             for record in records:
                 stmt = select(Team).where(Team.id == record.team_id)
                 result = await db_session.execute(stmt)
                 team = result.scalar_one_or_none()
-                if team and team.status == "banned":
-                    has_banned_team = True
-                    break
-            if has_banned_team:
+                if team:
+                    team_is_expired = team.expires_at and team.expires_at < get_now()
+                    if team.status in ("banned", "error", "expired") or team_is_expired:
+                        has_unavailable_team = True
+                        break
+            if has_unavailable_team:
                 return {
                     "success": True,
                     "can_reuse": True,
-                    "reason": "之前加入的 Team 已封号，可使用质保重复兑换",
+                    "reason": "之前加入的 Team 已不可用（封号/异常/过期），可使用质保重复兑换",
                     "error": None
                 }
             else:
                 return {
                     "success": True,
                     "can_reuse": False,
-                    "reason": "未找到被封号记录，且质保不支持正常过期或异常提示的重复兑换",
+                    "reason": "未找到不可用 Team 记录，且质保不支持正常使用中的重复兑换",
                     "error": None
                 }
 
